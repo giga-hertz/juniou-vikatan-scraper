@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import re
 import urllib.parse
 from datetime import datetime
 import email.utils
@@ -99,6 +100,67 @@ def fetch_articles_from_page():
 
     return article_links
 
+def clean_and_format_content(text):
+    """
+    Strips [## ] artifacts, formats Markdown bold/italics into HTML,
+    preserves line breaks with <br/>, and creates clean paragraph blocks.
+    """
+    if not text:
+        return ""
+
+    # 1. Strip [## ] artifacts and any attached URLs or markdown link brackets
+    text = re.sub(r'#{0,6}\s*\[##\s*\]\s*(?:\([^\)]+\)|<[^>]+>|\[[^\]]+\]\([^\)]+\)|https?://\S+)?', '', text)
+    text = re.sub(r'\[\s*\](?:\([^\)]*\)|<[^>]+>)?', '', text)
+
+    # 2. Drop lines that contain only markdown hash symbols
+    cleaned_lines = []
+    for line in text.split('\n'):
+        if re.match(r'^#{1,6}\s*$', line.strip()):
+            continue
+        cleaned_lines.append(line)
+    text = '\n'.join(cleaned_lines)
+
+    # 3. Split by double-newlines into major blocks
+    raw_blocks = [b.strip() for b in re.split(r'\n\s*\n', text) if b.strip()]
+
+    html_out = []
+    for block in raw_blocks:
+        lines = [line.strip() for line in block.split('\n') if line.strip()]
+        if not lines:
+            continue
+
+        current_para = []
+        for line in lines:
+            # Check for Markdown heading (#, ##, ###, etc.)
+            h_match = re.match(r'^(#{1,6})\s+(.+)$', line)
+            if h_match:
+                if current_para:
+                    html_out.append(f"<p>{'<br/>'.join(current_para)}</p>")
+                    current_para = []
+                level = len(h_match.group(1))
+                h_text = h_match.group(2).strip()
+                h_text = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', h_text)
+                h_text = re.sub(r'__(.+?)__', r'<strong>\1</strong>', h_text)
+                tag = f"h{min(level + 2, 6)}"
+                html_out.append(f"<{tag}>{h_text}</{tag}>")
+            else:
+                # Format bold text (**text** or __text__)
+                line = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', line)
+                line = re.sub(r'__(.+?)__', r'<strong>\1</strong>', line)
+
+                # Format italics (*text*)
+                line = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'<em>\1</em>', line)
+
+                # Format markdown links [text](url)
+                line = re.sub(r'\[([^\]]+)\]\((https?://[^\)]+)\)', r'<a href="\2" target="_blank" rel="noopener noreferrer">\1</a>', line)
+
+                current_para.append(line)
+
+        if current_para:
+            html_out.append(f"<p>{'<br/>'.join(current_para)}</p>")
+
+    return "".join(html_out)
+
 def fetch_content_from_smry(article_url):
     """Queries SMRY reader with pacing, handling 202 status and fallbacks."""
     time.sleep(3.5)  # Stay strictly within SMRY burst limits
@@ -119,7 +181,7 @@ def fetch_content_from_smry(article_url):
             data = resp.json()
             content = data.get("content") or data.get("text") or data.get("markdown") or ""
             if isinstance(content, str) and len(content.strip()) > 100:
-                return format_raw_paragraphs(content)
+                return clean_and_format_content(content)
     except Exception as e:
         print(f"SMRY API attempt failed: {e}")
 
@@ -128,22 +190,11 @@ def fetch_content_from_smry(article_url):
         prefix_url = f"https://r.smry.ai/{article_url}"
         alt_resp = requests.get(prefix_url, headers={"User-Agent": HEADERS["User-Agent"]}, timeout=20)
         if alt_resp.status_code == 200 and len(alt_resp.text.strip()) > 150:
-            return format_raw_paragraphs(alt_resp.text)
+            return clean_and_format_content(alt_resp.text)
     except Exception as e:
         print(f"SMRY prefix attempt failed: {e}")
 
     return None
-
-def format_raw_paragraphs(text):
-    """Converts raw text lines into clean HTML paragraph markup."""
-    blocks = [b.strip() for b in text.split("\n\n") if len(b.strip()) > 20]
-    html_out = []
-    for block in blocks:
-        if block.startswith("#"):
-            html_out.append(f"<h4>{block.lstrip('#').strip()}</h4>")
-        else:
-            html_out.append(f"<p>{block}</p>")
-    return "".join(html_out)
 
 def parse_article_details(url):
     """Fetches article metadata and full text with local preview fallback."""
@@ -259,7 +310,7 @@ def create_item_node(dom, article):
     # Description
     desc_content = ""
     if article["image_url"]:
-        desc_content += f'<p><img src="{article["image_url"]}" style="max-width:100%;" /></p>'
+        desc_content += f'<p><img src="{article["image_url"]}" style="max-width:100%; height:auto;" /></p>'
     if article["summary"]:
         desc_content += f'<p><strong>சுருக்கம்: {article["summary"]}</strong></p><hr/>'
     if article["body_html"]:
@@ -310,7 +361,6 @@ def main():
     existing_items = list(channel.getElementsByTagName("item"))
     existing_ids = {get_item_identifier(it) for it in existing_items if get_item_identifier(it)}
 
-    # Scrape only the single page
     candidate_links = fetch_articles_from_page()
     print(f"Total stories found on Junior Vikatan page: {len(candidate_links)}")
 
