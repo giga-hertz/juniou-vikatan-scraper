@@ -15,6 +15,12 @@ SMRY_API_ENDPOINT = "https://r.smry.ai/api/v1/read"
 OUTPUT_FILE = "feed.xml"
 MAX_ITEMS = 100
 
+# Pattern to detect edition date slugs (e.g., 08-nov-2026, 2026-nov-08, 08-11-2026)
+DATE_ISSUE_PATTERN = re.compile(
+    r'\b(?:\d{1,2}-[a-zA-Z]{3,9}-\d{4}|\d{4}-[a-zA-Z]{3,9}-\d{1,2}|\d{1,2}-\d{1,2}-\d{4})\b',
+    re.IGNORECASE
+)
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -47,7 +53,7 @@ def get_item_identifier(item):
     return None
 
 def fetch_articles_from_page():
-    """Scrapes only the article cards displayed on the Junior Vikatan landing page."""
+    """Scrapes only the target landing page, skipping dated issue URLs."""
     try:
         response = requests.get(TARGET_PAGE_URL, headers=HEADERS, timeout=15)
         response.raise_for_status()
@@ -57,7 +63,6 @@ def fetch_articles_from_page():
 
     soup = BeautifulSoup(response.text, "html.parser")
 
-    # Decompose global header, navigation bar, and footer to prevent crawling site-wide menus
     for tag in soup(["header", "nav", "footer"]):
         tag.decompose()
 
@@ -79,20 +84,20 @@ def fetch_articles_from_page():
         clean = clean_url(full_url)
         parsed = urllib.parse.urlparse(clean)
 
-        # Must be internal to vikatan.com
         if "vikatan.com" not in parsed.netloc:
             continue
 
-        # Skip landing page itself
         if clean in (BASE_URL, f"{BASE_URL}/juniorvikatan", clean_url(TARGET_PAGE_URL)):
             continue
 
-        # Skip administrative/utility pages
         path = parsed.path.lower()
         if any(pat in path for pat in ignore_patterns):
             continue
 
-        # Valid articles have at least 2 path segments (e.g. /category/story-slug)
+        # Skip issue date links (e.g., /juniorvikatan/08-nov-2026)
+        if DATE_ISSUE_PATTERN.search(parsed.path):
+            continue
+
         segments = [s for s in parsed.path.strip("/").split("/") if s]
         if len(segments) >= 2 and clean not in seen:
             seen.add(clean)
@@ -102,17 +107,34 @@ def fetch_articles_from_page():
 
 def clean_and_format_content(text):
     """
-    Strips [## ] artifacts, formats Markdown bold/italics into HTML,
-    preserves line breaks with <br/>, and creates clean paragraph blocks.
+    Cleans SMRY markdown:
+    - Removes any link starting with [ and ending with ] followed by a URL.
+    - Strips [## ] anchors, empty brackets, and standalone URLs.
+    - Preserves Markdown bold (**text**) globally before splitting lines.
+    - Automatically bolds Tamil dialogue prompts (கேள்வி:, பதில்:, etc.).
+    - Wraps each paragraph in spaced <p> tags with proper line-height.
     """
     if not text:
         return ""
 
-    # 1. Strip [## ] artifacts and any attached URLs or markdown link brackets
-    text = re.sub(r'#{0,6}\s*\[##\s*\]\s*(?:\([^\)]+\)|<[^>]+>|\[[^\]]+\]\([^\)]+\)|https?://\S+)?', '', text)
-    text = re.sub(r'\[\s*\](?:\([^\)]*\)|<[^>]+>)?', '', text)
+    # 1. Remove nested image links like [![img](url)](url)
+    text = re.sub(r'\[\s*!\[[^\]]*\]\([^\)]+\)\s*\](?:\([^\)]+\)|https?://\S+)?', '', text)
 
-    # 2. Drop lines that contain only markdown hash symbols
+    # 2. Remove all [text] followed by a URL (e.g., [text](url), [text] url, [text]: url, ## [text](url))
+    link_pattern = re.compile(
+        r'#{0,6}\s*!?\[[^\]]*\]\s*:?\s*(?:\([^\)]+\)|<[^>]+>|https?://\S+)', 
+        re.IGNORECASE
+    )
+    prev = None
+    while prev != text:
+        prev = text
+        text = link_pattern.sub('', text)
+
+    # 3. Clean leftover empty brackets and bare URLs on their own lines
+    text = re.sub(r'\[\s*\](?:\([^\)]*\)|<[^>]+>)?', '', text)
+    text = re.sub(r'^\s*https?://\S+\s*$', '', text, flags=re.MULTILINE)
+
+    # 4. Drop lines that contain only markdown hash symbols
     cleaned_lines = []
     for line in text.split('\n'):
         if re.match(r'^#{1,6}\s*$', line.strip()):
@@ -120,57 +142,49 @@ def clean_and_format_content(text):
         cleaned_lines.append(line)
     text = '\n'.join(cleaned_lines)
 
-    # 3. Split by double-newlines into major blocks
-    raw_blocks = [b.strip() for b in re.split(r'\n\s*\n', text) if b.strip()]
+    # 5. Global Markdown bold & italics conversion BEFORE line splitting
+    text = re.sub(r'\*\*\s*([\s\S]+?)\s*\*\*', r'<strong>\1</strong>', text)
+    text = re.sub(r'__\s*([\s\S]+?)\s*__', r'<strong>\1</strong>', text)
+    text = re.sub(r'(?<!\*)\*(?!\*)\s*([^\*\n]+?)\s*(?<!\*)\*(?!\*)', r'<em>\1</em>', text)
+
+    # 6. Process line-by-line / paragraph-by-paragraph
+    raw_lines = [line.strip() for line in text.split('\n') if line.strip()]
 
     html_out = []
-    for block in raw_blocks:
-        lines = [line.strip() for line in block.split('\n') if line.strip()]
-        if not lines:
+    for line in raw_lines:
+        # Check for Markdown heading (#, ##, ###, etc.)
+        h_match = re.match(r'^(#{1,6})\s+(.+)$', line)
+        if h_match:
+            level = len(h_match.group(1))
+            heading_content = h_match.group(2).strip()
+            tag = f"h{min(level + 2, 6)}"
+            html_out.append(f'<{tag} style="margin: 1.4em 0 0.6em 0; font-weight: 700; color: #111;">{heading_content}</{tag}>')
             continue
 
-        current_para = []
-        for line in lines:
-            # Check for Markdown heading (#, ##, ###, etc.)
-            h_match = re.match(r'^(#{1,6})\s+(.+)$', line)
-            if h_match:
-                if current_para:
-                    html_out.append(f"<p>{'<br/>'.join(current_para)}</p>")
-                    current_para = []
-                level = len(h_match.group(1))
-                h_text = h_match.group(2).strip()
-                h_text = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', h_text)
-                h_text = re.sub(r'__(.+?)__', r'<strong>\1</strong>', h_text)
-                tag = f"h{min(level + 2, 6)}"
-                html_out.append(f"<{tag}>{h_text}</{tag}>")
-            else:
-                # Format bold text (**text** or __text__)
-                line = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', line)
-                line = re.sub(r'__(.+?)__', r'<strong>\1</strong>', line)
+        # Check for list items
+        if re.match(r'^[-*•]\s+', line):
+            item_text = re.sub(r'^[-*•]\s+', '', line)
+            html_out.append(f'<li style="margin-bottom: 0.6em; line-height: 1.85;">{item_text}</li>')
+            continue
 
-                # Format italics (*text*)
-                line = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'<em>\1</em>', line)
+        # Format Tamil dialogue/interview prefixes if not already bolded
+        dialogue_pattern = r'^(?!\s*<strong[ >])((?:கேள்வி|பதில்|கழுகார் பதில்|கழுகார்|செய்தியாளர்)\s*[:：])\s*'
+        line = re.sub(dialogue_pattern, r'<strong>\1</strong> ', line)
 
-                # Format markdown links [text](url)
-                line = re.sub(r'\[([^\]]+)\]\((https?://[^\)]+)\)', r'<a href="\2" target="_blank" rel="noopener noreferrer">\1</a>', line)
-
-                current_para.append(line)
-
-        if current_para:
-            html_out.append(f"<p>{'<br/>'.join(current_para)}</p>")
+        # Wrap each paragraph with comfortable line spacing and bottom margins
+        html_out.append(f'<p style="margin: 0 0 1.25em 0; line-height: 1.85; font-size: 1.05em; color: #222;">{line}</p>')
 
     return "".join(html_out)
 
 def fetch_content_from_smry(article_url):
-    """Queries SMRY reader with pacing, handling 202 status and fallbacks."""
-    time.sleep(3.5)  # Stay strictly within SMRY burst limits
+    """Queries SMRY reader with nominal pacing, handling 202 status and fallbacks."""
+    time.sleep(3.5)
 
     api_headers = {
         "User-Agent": HEADERS["User-Agent"],
         "Accept": "application/json"
     }
 
-    # Method 1: SMRY JSON API
     try:
         resp = requests.get(SMRY_API_ENDPOINT, params={"url": article_url}, headers=api_headers, timeout=20)
         if resp.status_code == 202:
@@ -185,7 +199,6 @@ def fetch_content_from_smry(article_url):
     except Exception as e:
         print(f"SMRY API attempt failed: {e}")
 
-    # Method 2: SMRY Reader Web Endpoint Fallback
     try:
         prefix_url = f"https://r.smry.ai/{article_url}"
         alt_resp = requests.get(prefix_url, headers={"User-Agent": HEADERS["User-Agent"]}, timeout=20)
@@ -208,21 +221,17 @@ def parse_article_details(url):
 
     soup = BeautifulSoup(res.text, "html.parser")
 
-    # 1. Headline
     title_meta = soup.find("meta", property="og:title")
     title = title_meta["content"].strip() if title_meta and title_meta.get("content") else ""
     if not title and soup.title:
         title = soup.title.string.strip()
 
-    # 2. Summary
     desc_meta = soup.find("meta", property="og:description") or soup.find("meta", attrs={"name": "description"})
     summary = desc_meta["content"].strip() if desc_meta and desc_meta.get("content") else ""
 
-    # 3. Image
     img_meta = soup.find("meta", property="og:image")
     image_url = img_meta["content"].strip() if img_meta and img_meta.get("content") else ""
 
-    # 4. Publication Date
     date_meta = soup.find("meta", property="article:published_time")
     pub_date_str = email.utils.formatdate(usegmt=True)
     if date_meta and date_meta.get("content"):
@@ -232,15 +241,12 @@ def parse_article_details(url):
         except Exception:
             pass
 
-    # 5. Category
     section_meta = soup.find("meta", property="article:section")
     category_name = section_meta["content"].strip() if section_meta and section_meta.get("content") else "Junior Vikatan"
 
-    # 6. SMRY Content
     print(f"Fetching SMRY text for: {url}")
     body_html = fetch_content_from_smry(url)
 
-    # 7. Local preview fallback if SMRY returns empty
     if not body_html:
         paragraphs = []
         for p in soup.find_all("p"):
@@ -249,7 +255,7 @@ def parse_article_details(url):
                 break
             text = p.get_text().strip()
             if len(text) > 30:
-                paragraphs.append(f"<p>{text}</p>")
+                paragraphs.append(f'<p style="margin: 0 0 1.25em 0; line-height: 1.85;">{text}</p>')
             if len(paragraphs) >= 3:
                 break
         body_html = "".join(paragraphs)
@@ -266,15 +272,13 @@ def parse_article_details(url):
     }
 
 def create_item_node(dom, article):
-    """Creates a standard RSS 2.0 item node."""
+    """Creates an RSS 2.0 item with both <description> and rich <content:encoded>."""
     item = dom.createElement("item")
 
-    # Title
     title_elem = dom.createElement("title")
     title_elem.appendChild(dom.createCDATASection(article["title"]))
     item.appendChild(title_elem)
 
-    # Link & GUID
     link_elem = dom.createElement("link")
     link_elem.appendChild(dom.createTextNode(article["link"]))
     item.appendChild(link_elem)
@@ -284,22 +288,18 @@ def create_item_node(dom, article):
     guid_elem.appendChild(dom.createTextNode(article["link"]))
     item.appendChild(guid_elem)
 
-    # Creator
     author_elem = dom.createElement("dc:creator")
     author_elem.appendChild(dom.createCDATASection("ஜூனியர் விகடன் (Junior Vikatan)"))
     item.appendChild(author_elem)
 
-    # PubDate
     pub_elem = dom.createElement("pubDate")
     pub_elem.appendChild(dom.createTextNode(article["pub_date"]))
     item.appendChild(pub_elem)
 
-    # Category
     cat_elem = dom.createElement("category")
     cat_elem.appendChild(dom.createCDATASection(article["category"]))
     item.appendChild(cat_elem)
 
-    # Enclosure Image
     if article["image_url"]:
         enclosure = dom.createElement("enclosure")
         enclosure.setAttribute("url", article["image_url"])
@@ -307,19 +307,23 @@ def create_item_node(dom, article):
         enclosure.setAttribute("length", "0")
         item.appendChild(enclosure)
 
-    # Description
-    desc_content = ""
+    full_html = ""
     if article["image_url"]:
-        desc_content += f'<p><img src="{article["image_url"]}" style="max-width:100%; height:auto;" /></p>'
+        full_html += f'<p style="margin-bottom: 1.25em;"><img src="{article["image_url"]}" style="max-width:100%; height:auto; border-radius: 6px;" /></p>'
     if article["summary"]:
-        desc_content += f'<p><strong>சுருக்கம்: {article["summary"]}</strong></p><hr/>'
+        full_html += f'<p style="margin-bottom: 1.25em; font-size: 1.1em; color: #444;"><strong>{article["summary"]}</strong></p><hr style="border:0; border-top: 1px solid #eee; margin: 1.5em 0;"/>'
     if article["body_html"]:
-        desc_content += article["body_html"]
-    desc_content += f'<p><br/><a href="{article["smry_link"]}" target="_blank">📖 Read Full Article on SMRY</a></p>'
+        full_html += article["body_html"]
+    full_html += f'<p style="margin-top: 2em; padding-top: 1em; border-top: 1px solid #eee;"><a href="{article["smry_link"]}" target="_blank" style="color: #0066cc; text-decoration: underline;">📖 Open in SMRY Reader</a></p>'
 
     desc_elem = dom.createElement("description")
-    desc_elem.appendChild(dom.createCDATASection(desc_content))
+    desc_summary = article["summary"] if article["summary"] else article["title"]
+    desc_elem.appendChild(dom.createCDATASection(f"<p>{desc_summary}</p>"))
     item.appendChild(desc_elem)
+
+    content_encoded_elem = dom.createElement("content:encoded")
+    content_encoded_elem.appendChild(dom.createCDATASection(full_html))
+    item.appendChild(content_encoded_elem)
 
     return item
 
@@ -362,13 +366,13 @@ def main():
     existing_ids = {get_item_identifier(it) for it in existing_items if get_item_identifier(it)}
 
     candidate_links = fetch_articles_from_page()
-    print(f"Total stories found on Junior Vikatan page: {len(candidate_links)}")
+    print(f"Total non-dated articles found on target page: {len(candidate_links)}")
 
     new_links = [l for l in candidate_links if clean_url(l) not in existing_ids]
-    print(f"New stories to add: {len(new_links)}")
+    print(f"New articles to add: {len(new_links)}")
 
     if not new_links:
-        print("No new stories found on the page. Exiting.")
+        print("No new articles found. Exiting.")
         return
 
     new_item_nodes = []
@@ -378,7 +382,6 @@ def main():
             item_node = create_item_node(dom, article_data)
             new_item_nodes.append(item_node)
 
-    # Insert newest items at the top
     first_existing = existing_items[0] if existing_items else None
     for item_node in new_item_nodes:
         if first_existing:
@@ -388,7 +391,6 @@ def main():
             channel.appendChild(dom.createTextNode("\n    "))
             channel.appendChild(item_node)
 
-    # Maintain 100 maximum entries
     all_items = list(channel.getElementsByTagName("item"))
     if len(all_items) > MAX_ITEMS:
         for excess in all_items[MAX_ITEMS:]:
@@ -400,7 +402,7 @@ def main():
     with open(OUTPUT_FILE, "wb") as f:
         f.write(dom.toxml(encoding="utf-8"))
 
-    print(f"Successfully processed {len(new_item_nodes)} new articles. Feed saved to {OUTPUT_FILE}.")
+    print(f"Successfully processed {len(new_item_nodes)} articles. Feed saved to {OUTPUT_FILE}.")
 
 if __name__ == "__main__":
     main()
