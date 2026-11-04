@@ -1,6 +1,6 @@
 import os
 import sys
-import re
+import time
 import urllib.parse
 from datetime import datetime
 import email.utils
@@ -9,11 +9,23 @@ import requests
 from bs4 import BeautifulSoup
 
 BASE_URL = "https://www.vikatan.com"
-LISTING_URL = "https://www.vikatan.com/juniorvikatan?pfrom=header-submenu"
-TARGET_SECTION = "government-and-politics"
+MAIN_MENU_URL = "https://www.vikatan.com/juniorvikatan?pfrom=header-submenu"
 SMRY_API_ENDPOINT = "https://r.smry.ai/api/v1/read"
 OUTPUT_FILE = "feed.xml"
 MAX_ITEMS = 100
+
+# Hoverable category link texts
+HOVER_CATEGORIES = [
+    "கழுகார்",
+    "அரசியல்",
+    "தொடர்கள்",
+    "அலசல்",
+    "க்ரைம்",
+    "சமூகம்"
+]
+
+# Non-link section label
+COVER_STORY_LABEL = "கவர் ஸ்டோரி"
 
 HEADERS = {
     "User-Agent": (
@@ -24,115 +36,172 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
+def clean_url(url):
+    """Strips tracking query strings and trailing slashes for stable identifiers."""
+    parsed = urllib.parse.urlparse(url)
+    return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", "", ""))
+
 def get_text_content(element):
-    """Safely extracts text or CDATA content from an XML element."""
+    """Safely extracts text or CDATA node contents."""
     return "".join(
         c.nodeValue for c in element.childNodes 
         if c.nodeType in (c.TEXT_NODE, c.CDATA_SECTION_NODE)
     ).strip()
 
 def get_item_identifier(item):
-    """Returns a unique identifier using <guid> or <link>."""
+    """Extracts unique GUID or Link from an XML item."""
     for tag in ("guid", "link"):
         nodes = item.getElementsByTagName(tag)
         if nodes:
             val = get_text_content(nodes[0])
             if val:
-                return val
+                return clean_url(val)
     return None
 
-def fetch_article_links():
-    """Scrapes links from the listing page, focusing on government-and-politics stories."""
+def fetch_cover_story_links(soup):
+    """Extracts article links under the non-hoverable 'கவர் ஸ்டோரி' label."""
+    cover_links = set()
+    
+    # Locate elements containing 'கவர் ஸ்டோரி'
+    label_nodes = soup.find_all(lambda el: el.string and COVER_STORY_LABEL in el.string.strip())
+    if not label_nodes:
+        # Fallback to general text search if direct string doesn't match
+        label_nodes = [el for el in soup.find_all(["h2", "h3", "h4", "div", "span", "p"]) if COVER_STORY_LABEL in el.get_text()]
+
+    for node in label_nodes:
+        # Check within parent card/container
+        parent = node.find_parent(["div", "section", "article"])
+        if parent:
+            for a in parent.find_all("a", href=True):
+                href = a["href"].split("?")[0].strip()
+                full_url = urllib.parse.urljoin(BASE_URL, href)
+                if len(urllib.parse.urlparse(full_url).path.strip("/").split("/")) >= 2:
+                    cover_links.add(full_url)
+                    
+        # Also check immediately following sibling elements
+        sib = node.find_next_sibling()
+        if sib:
+            for a in sib.find_all("a", href=True):
+                href = a["href"].split("?")[0].strip()
+                full_url = urllib.parse.urljoin(BASE_URL, href)
+                if len(urllib.parse.urlparse(full_url).path.strip("/").split("/")) >= 2:
+                    cover_links.add(full_url)
+
+    print(f"Discovered {len(cover_links)} article link(s) under '{COVER_STORY_LABEL}'.")
+    return cover_links
+
+def fetch_all_candidate_links():
+    """Scrapes category URLs, hover menus, and 'கவர் ஸ்டோரி'."""
     try:
-        response = requests.get(LISTING_URL, headers=HEADERS, timeout=15)
+        response = requests.get(MAIN_MENU_URL, headers=HEADERS, timeout=15)
         response.raise_for_status()
     except Exception as e:
-        print(f"Error loading listing page: {e}", file=sys.stderr)
+        print(f"Error loading main page: {e}", file=sys.stderr)
         return []
 
     soup = BeautifulSoup(response.text, "html.parser")
-    candidate_links = set()
+    category_links = set()
 
+    # 1. Collect URLs for the 6 hover categories
     for a in soup.find_all("a", href=True):
-        href = a["href"].split("?")[0].strip()
-        if not href:
-            continue
+        text = a.get_text().strip()
+        if any(target in text for target in HOVER_CATEGORIES):
+            href = a["href"].split("?")[0].strip()
+            category_links.add(urllib.parse.urljoin(BASE_URL, href))
 
-        # Look for links targeting government-and-politics or juniorvikatan articles
-        if TARGET_SECTION in href or "/juniorvikatan/" in href:
-            full_url = urllib.parse.urljoin(BASE_URL, href)
-            path_segments = [p for p in urllib.parse.urlparse(full_url).path.split("/") if p]
+    # 2. Collect Cover Story links from the page
+    candidate_articles = set(fetch_cover_story_links(soup))
 
-            # Exclude landing pages, category indexes, or author tags
-            if full_url in (LISTING_URL, f"{BASE_URL}/juniorvikatan", f"{BASE_URL}/{TARGET_SECTION}"):
-                continue
+    # 3. Visit each hover category to gather its article links
+    for cat_url in category_links:
+        print(f"Scanning category: {cat_url}")
+        try:
+            res = requests.get(cat_url, headers=HEADERS, timeout=15)
+            if res.status_code == 200:
+                cat_soup = BeautifulSoup(res.text, "html.parser")
+                for a in cat_soup.find_all("a", href=True):
+                    href = a["href"].split("?")[0].strip()
+                    full_url = urllib.parse.urljoin(BASE_URL, href)
+                    if full_url != cat_url and full_url != BASE_URL:
+                        if len(urllib.parse.urlparse(full_url).path.strip("/").split("/")) >= 2:
+                            candidate_articles.add(full_url)
+        except Exception as e:
+            print(f"Error reading category {cat_url}: {e}")
+        time.sleep(1.5)  # Nominal delay between section pages
 
-            # Valid article paths typically have at least 2 path segments (e.g., /government-and-politics/slug)
-            if len(path_segments) >= 2:
-                candidate_links.add(full_url)
-
-    return list(candidate_links)
+    return list(candidate_articles)
 
 def fetch_content_from_smry(article_url):
-    """Queries SMRY's reader API to fetch parsed article text."""
+    """
+    Fetches full article content from SMRY with:
+    - 4-second nominal pacing
+    - HTTP 202 retry handling
+    - Prefix-reader fallback
+    """
+    time.sleep(4)  # Nominal delay to strictly stay under the 5 req/10s burst limit
+
+    api_headers = {
+        "User-Agent": HEADERS["User-Agent"],
+        "Accept": "application/json"
+    }
+
+    # Attempt 1: SMRY JSON API
     try:
-        params = {"url": article_url}
-        resp = requests.get(SMRY_API_ENDPOINT, params=params, headers={"User-Agent": HEADERS["User-Agent"]}, timeout=20)
+        resp = requests.get(SMRY_API_ENDPOINT, params={"url": article_url}, headers=api_headers, timeout=25)
+        
+        # If SMRY is compiling an uncached page (HTTP 202 Accepted), wait and retry once
+        if resp.status_code == 202:
+            print("SMRY compiling uncached article, waiting 5 seconds...")
+            time.sleep(5)
+            resp = requests.get(SMRY_API_ENDPOINT, params={"url": article_url}, headers=api_headers, timeout=25)
+
         if resp.status_code == 200:
             data = resp.json()
             content = data.get("content") or data.get("text") or data.get("markdown") or ""
             if isinstance(content, str) and len(content.strip()) > 100:
-                paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
-                html_paras = []
-                for p in paragraphs:
-                    if p.startswith("#"):
-                        html_paras.append(f"<h4>{p.lstrip('#').strip()}</h4>")
-                    else:
-                        html_paras.append(f"<p>{p}</p>")
-                return "".join(html_paras)
+                return format_raw_paragraphs(content)
+        else:
+            print(f"SMRY API returned status {resp.status_code} for {article_url}")
+
     except Exception as e:
-        print(f"SMRY reader query failed for {article_url}: {e}")
+        print(f"SMRY API request error: {e}")
+
+    # Attempt 2: Direct Prefix Reader Fallback (https://r.smry.ai/<url>)
+    try:
+        prefix_url = f"https://r.smry.ai/{article_url}"
+        alt_resp = requests.get(prefix_url, headers={"User-Agent": HEADERS["User-Agent"]}, timeout=20)
+        if alt_resp.status_code == 200 and len(alt_resp.text.strip()) > 150:
+            return format_raw_paragraphs(alt_resp.text)
+    except Exception as e:
+        print(f"Prefix reader fallback error: {e}")
+
     return None
 
+def format_raw_paragraphs(text):
+    """Formats text blocks into clean HTML paragraph markup."""
+    blocks = [b.strip() for b in text.split("\n\n") if len(b.strip()) > 20]
+    html_out = []
+    for block in blocks:
+        if block.startswith("#"):
+            clean_head = block.lstrip("#").strip()
+            html_out.append(f"<h4>{clean_head}</h4>")
+        else:
+            html_out.append(f"<p>{block}</p>")
+    return "".join(html_out)
+
 def parse_article_details(url):
-    """Verifies that the article redirects to government-and-politics, then parses content."""
+    """Scrapes headline, summary, featured image, and invokes SMRY with fallback."""
     try:
-        # requests automatically follows redirects (res.url is the final destination)
         res = requests.get(url, headers=HEADERS, timeout=15)
         if res.status_code != 200:
             return None
     except Exception as e:
-        print(f"Failed to fetch article {url}: {e}", file=sys.stderr)
+        print(f"Failed to fetch {url}: {e}", file=sys.stderr)
         return None
 
     soup = BeautifulSoup(res.text, "html.parser")
-    final_url = res.url.split("?")[0]
 
-    # Verify canonical URL
-    canonical = soup.find("link", rel="canonical")
-    canonical_url = canonical["href"].split("?")[0] if canonical and canonical.get("href") else ""
-
-    # Check section meta tag
-    section_meta = soup.find("meta", property="article:section")
-    section_name = section_meta["content"].lower() if section_meta and section_meta.get("content") else ""
-
-    # CONDITION: Must resolve/redirect to government-and-politics
-    is_target_page = (
-        TARGET_SECTION in url
-        or TARGET_SECTION in final_url
-        or TARGET_SECTION in canonical_url
-        or "government" in section_name
-        or "politics" in section_name
-    )
-
-    if not is_target_page:
-        print(f"Skipping non-target article: {final_url}")
-        return None
-
-    # Use the resolved article URL
-    resolved_url = canonical_url if canonical_url else final_url
-
-    # 1. Headline
+    # 1. Title
     title_meta = soup.find("meta", property="og:title")
     title = title_meta["content"].strip() if title_meta and title_meta.get("content") else ""
     if not title and soup.title:
@@ -142,7 +211,7 @@ def parse_article_details(url):
     desc_meta = soup.find("meta", property="og:description") or soup.find("meta", attrs={"name": "description"})
     summary = desc_meta["content"].strip() if desc_meta and desc_meta.get("content") else ""
 
-    # 3. Featured Image
+    # 3. Image
     img_meta = soup.find("meta", property="og:image")
     image_url = img_meta["content"].strip() if img_meta and img_meta.get("content") else ""
 
@@ -156,35 +225,42 @@ def parse_article_details(url):
         except Exception:
             pass
 
-    # 5. Fetch full content via SMRY
-    body_html = fetch_content_from_smry(resolved_url)
+    # 5. Category
+    section_meta = soup.find("meta", property="article:section")
+    category_name = section_meta["content"].strip() if section_meta and section_meta.get("content") else "Junior Vikatan"
 
-    # 6. Fallback to public preview paragraphs if SMRY returns empty
+    # 6. Full Text via SMRY
+    print(f"Fetching SMRY content for: {url}")
+    body_html = fetch_content_from_smry(url)
+
+    # 7. Local preview fallback if SMRY returns no text
     if not body_html:
-        fallback_paragraphs = []
+        print("SMRY returned empty/blocked. Using available local preview text.")
+        paragraphs = []
         for p in soup.find_all("p"):
             parent_class = " ".join(p.parent.get("class", []))
             if any(term in parent_class.lower() for term in ("paywall", "subscribe", "footer", "modal")):
                 break
             text = p.get_text().strip()
             if len(text) > 30:
-                fallback_paragraphs.append(f"<p>{text}</p>")
-            if len(fallback_paragraphs) >= 3:
+                paragraphs.append(f"<p>{text}</p>")
+            if len(paragraphs) >= 3:
                 break
-        body_html = "".join(fallback_paragraphs)
+        body_html = "".join(paragraphs)
 
     return {
         "title": title,
-        "link": resolved_url,
+        "link": clean_url(url),
         "summary": summary,
         "image_url": image_url,
         "pub_date": pub_date_str,
+        "category": category_name,
         "body_html": body_html,
-        "smry_link": f"https://smry.ai/{resolved_url}"
+        "smry_link": f"https://smry.ai/{clean_url(url)}"
     }
 
 def create_item_node(dom, article):
-    """Creates a standard RSS <item> node."""
+    """Creates a standard RSS 2.0 item node."""
     item = dom.createElement("item")
 
     # Title
@@ -192,7 +268,7 @@ def create_item_node(dom, article):
     title_elem.appendChild(dom.createCDATASection(article["title"]))
     item.appendChild(title_elem)
 
-    # Link & Guid
+    # Link & GUID
     link_elem = dom.createElement("link")
     link_elem.appendChild(dom.createTextNode(article["link"]))
     item.appendChild(link_elem)
@@ -202,6 +278,11 @@ def create_item_node(dom, article):
     guid_elem.appendChild(dom.createTextNode(article["link"]))
     item.appendChild(guid_elem)
 
+    # Creator
+    author_elem = dom.createElement("dc:creator")
+    author_elem.appendChild(dom.createCDATASection("ஜூனியர் விகடன் (Junior Vikatan)"))
+    item.appendChild(author_elem)
+
     # PubDate
     pub_elem = dom.createElement("pubDate")
     pub_elem.appendChild(dom.createTextNode(article["pub_date"]))
@@ -209,8 +290,16 @@ def create_item_node(dom, article):
 
     # Category
     cat_elem = dom.createElement("category")
-    cat_elem.appendChild(dom.createCDATASection("government-and-politics"))
+    cat_elem.appendChild(dom.createCDATASection(article["category"]))
     item.appendChild(cat_elem)
+
+    # Image Enclosure
+    if article["image_url"]:
+        enclosure = dom.createElement("enclosure")
+        enclosure.setAttribute("url", article["image_url"])
+        enclosure.setAttribute("type", "image/jpeg")
+        enclosure.setAttribute("length", "0")
+        item.appendChild(enclosure)
 
     # Description
     desc_content = ""
@@ -220,7 +309,7 @@ def create_item_node(dom, article):
         desc_content += f'<p><strong>சுருக்கம்: {article["summary"]}</strong></p><hr/>'
     if article["body_html"]:
         desc_content += article["body_html"]
-    desc_content += f'<p><br/><a href="{article["smry_link"]}" target="_blank">📖 Open in SMRY Reader</a></p>'
+    desc_content += f'<p><br/><a href="{article["smry_link"]}" target="_blank">📖 Read Full Article on SMRY</a></p>'
 
     desc_elem = dom.createElement("description")
     desc_elem.appendChild(dom.createCDATASection(desc_content))
@@ -234,20 +323,21 @@ def initialize_empty_feed():
     rss = dom.documentElement
     rss.setAttribute("version", "2.0")
     rss.setAttribute("xmlns:content", "http://purl.org/rss/1.0/modules/content/")
+    rss.setAttribute("xmlns:dc", "http://purl.org/dc/elements/1.1/")
 
     channel = dom.createElement("channel")
     rss.appendChild(channel)
 
     title = dom.createElement("title")
-    title.appendChild(dom.createTextNode("Junior Vikatan - Government & Politics"))
+    title.appendChild(dom.createTextNode("Junior Vikatan Feed"))
     channel.appendChild(title)
 
     link = dom.createElement("link")
-    link.appendChild(dom.createTextNode(LISTING_URL))
+    link.appendChild(dom.createTextNode(MAIN_MENU_URL))
     channel.appendChild(link)
 
     desc = dom.createElement("description")
-    desc.appendChild(dom.createTextNode("Junior Vikatan articles under Government and Politics"))
+    desc.appendChild(dom.createTextNode("Junior Vikatan Cover Story and Featured Categories"))
     channel.appendChild(desc)
 
     return dom, channel
@@ -265,11 +355,15 @@ def main():
     existing_items = list(channel.getElementsByTagName("item"))
     existing_ids = {get_item_identifier(it) for it in existing_items if get_item_identifier(it)}
 
-    candidate_links = fetch_article_links()
-    print(f"Discovered {len(candidate_links)} candidate links.")
+    candidate_links = fetch_all_candidate_links()
+    print(f"Total discovered candidate links: {len(candidate_links)}")
 
-    new_links = [l for l in candidate_links if l not in existing_ids]
-    print(f"Processing {len(new_links)} unindexed links...")
+    new_links = [l for l in candidate_links if clean_url(l) not in existing_ids]
+    print(f"New articles to process: {len(new_links)}")
+
+    if not new_links:
+        print("No new articles found. Exiting.")
+        return
 
     new_item_nodes = []
     for link in new_links:
@@ -278,11 +372,7 @@ def main():
             item_node = create_item_node(dom, article_data)
             new_item_nodes.append(item_node)
 
-    if not new_item_nodes:
-        print("No new government-and-politics articles found.")
-        return
-
-    # Prepend newest articles to the top
+    # Insert newest articles at the top
     first_existing = existing_items[0] if existing_items else None
     for item_node in new_item_nodes:
         if first_existing:
@@ -292,7 +382,7 @@ def main():
             channel.appendChild(dom.createTextNode("\n    "))
             channel.appendChild(item_node)
 
-    # Retain maximum 100 items
+    # Maintain 100-item maximum
     all_items = list(channel.getElementsByTagName("item"))
     if len(all_items) > MAX_ITEMS:
         for excess in all_items[MAX_ITEMS:]:
@@ -304,8 +394,7 @@ def main():
     with open(OUTPUT_FILE, "wb") as f:
         f.write(dom.toxml(encoding="utf-8"))
 
-    total = len(channel.getElementsByTagName("item"))
-    print(f"Successfully added {len(new_item_nodes)} government-and-politics articles. Total items: {total}")
+    print(f"Successfully added {len(new_item_nodes)} new articles to {OUTPUT_FILE}.")
 
 if __name__ == "__main__":
     main()
