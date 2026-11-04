@@ -9,23 +9,10 @@ import requests
 from bs4 import BeautifulSoup
 
 BASE_URL = "https://www.vikatan.com"
-MAIN_MENU_URL = "https://www.vikatan.com/juniorvikatan?pfrom=header-submenu"
+TARGET_PAGE_URL = "https://www.vikatan.com/juniorvikatan?pfrom=header-submenu"
 SMRY_API_ENDPOINT = "https://r.smry.ai/api/v1/read"
 OUTPUT_FILE = "feed.xml"
 MAX_ITEMS = 100
-
-# Hoverable category link texts
-HOVER_CATEGORIES = [
-    "கழுகார்",
-    "அரசியல்",
-    "தொடர்கள்",
-    "அலசல்",
-    "க்ரைம்",
-    "சமூகம்"
-]
-
-# Non-link section label
-COVER_STORY_LABEL = "கவர் ஸ்டோரி"
 
 HEADERS = {
     "User-Agent": (
@@ -37,7 +24,7 @@ HEADERS = {
 }
 
 def clean_url(url):
-    """Strips tracking query strings and trailing slashes for stable identifiers."""
+    """Strips query strings and trailing slashes for reliable GUIDs."""
     parsed = urllib.parse.urlparse(url)
     return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", "", ""))
 
@@ -49,7 +36,7 @@ def get_text_content(element):
     ).strip()
 
 def get_item_identifier(item):
-    """Extracts unique GUID or Link from an XML item."""
+    """Extracts unique GUID or link from an existing item."""
     for tag in ("guid", "link"):
         nodes = item.getElementsByTagName(tag)
         if nodes:
@@ -58,150 +45,119 @@ def get_item_identifier(item):
                 return clean_url(val)
     return None
 
-def fetch_cover_story_links(soup):
-    """Extracts article links under the non-hoverable 'கவர் ஸ்டோரி' label."""
-    cover_links = set()
-    
-    # Locate elements containing 'கவர் ஸ்டோரி'
-    label_nodes = soup.find_all(lambda el: el.string and COVER_STORY_LABEL in el.string.strip())
-    if not label_nodes:
-        # Fallback to general text search if direct string doesn't match
-        label_nodes = [el for el in soup.find_all(["h2", "h3", "h4", "div", "span", "p"]) if COVER_STORY_LABEL in el.get_text()]
-
-    for node in label_nodes:
-        # Check within parent card/container
-        parent = node.find_parent(["div", "section", "article"])
-        if parent:
-            for a in parent.find_all("a", href=True):
-                href = a["href"].split("?")[0].strip()
-                full_url = urllib.parse.urljoin(BASE_URL, href)
-                if len(urllib.parse.urlparse(full_url).path.strip("/").split("/")) >= 2:
-                    cover_links.add(full_url)
-                    
-        # Also check immediately following sibling elements
-        sib = node.find_next_sibling()
-        if sib:
-            for a in sib.find_all("a", href=True):
-                href = a["href"].split("?")[0].strip()
-                full_url = urllib.parse.urljoin(BASE_URL, href)
-                if len(urllib.parse.urlparse(full_url).path.strip("/").split("/")) >= 2:
-                    cover_links.add(full_url)
-
-    print(f"Discovered {len(cover_links)} article link(s) under '{COVER_STORY_LABEL}'.")
-    return cover_links
-
-def fetch_all_candidate_links():
-    """Scrapes category URLs, hover menus, and 'கவர் ஸ்டோரி'."""
+def fetch_articles_from_page():
+    """Scrapes only the article cards displayed on the Junior Vikatan landing page."""
     try:
-        response = requests.get(MAIN_MENU_URL, headers=HEADERS, timeout=15)
+        response = requests.get(TARGET_PAGE_URL, headers=HEADERS, timeout=15)
         response.raise_for_status()
     except Exception as e:
-        print(f"Error loading main page: {e}", file=sys.stderr)
+        print(f"Error loading target page: {e}", file=sys.stderr)
         return []
 
     soup = BeautifulSoup(response.text, "html.parser")
-    category_links = set()
 
-    # 1. Collect URLs for the 6 hover categories
+    # Decompose global header, navigation bar, and footer to prevent crawling site-wide menus
+    for tag in soup(["header", "nav", "footer"]):
+        tag.decompose()
+
+    ignore_patterns = [
+        "/tag", "/tags", "/author", "/authors", "/topic", "/topics",
+        "/subscribe", "/login", "/register", "/terms", "/privacy",
+        "/about-us", "/contact-us", "/newsletter", "/epaper"
+    ]
+
+    article_links = []
+    seen = set()
+
     for a in soup.find_all("a", href=True):
-        text = a.get_text().strip()
-        if any(target in text for target in HOVER_CATEGORIES):
-            href = a["href"].split("?")[0].strip()
-            category_links.add(urllib.parse.urljoin(BASE_URL, href))
+        raw_href = a["href"].split("?")[0].strip()
+        if not raw_href or raw_href.startswith("#") or raw_href.startswith("javascript:"):
+            continue
 
-    # 2. Collect Cover Story links from the page
-    candidate_articles = set(fetch_cover_story_links(soup))
+        full_url = urllib.parse.urljoin(BASE_URL, raw_href)
+        clean = clean_url(full_url)
+        parsed = urllib.parse.urlparse(clean)
 
-    # 3. Visit each hover category to gather its article links
-    for cat_url in category_links:
-        print(f"Scanning category: {cat_url}")
-        try:
-            res = requests.get(cat_url, headers=HEADERS, timeout=15)
-            if res.status_code == 200:
-                cat_soup = BeautifulSoup(res.text, "html.parser")
-                for a in cat_soup.find_all("a", href=True):
-                    href = a["href"].split("?")[0].strip()
-                    full_url = urllib.parse.urljoin(BASE_URL, href)
-                    if full_url != cat_url and full_url != BASE_URL:
-                        if len(urllib.parse.urlparse(full_url).path.strip("/").split("/")) >= 2:
-                            candidate_articles.add(full_url)
-        except Exception as e:
-            print(f"Error reading category {cat_url}: {e}")
-        time.sleep(1.5)  # Nominal delay between section pages
+        # Must be internal to vikatan.com
+        if "vikatan.com" not in parsed.netloc:
+            continue
 
-    return list(candidate_articles)
+        # Skip landing page itself
+        if clean in (BASE_URL, f"{BASE_URL}/juniorvikatan", clean_url(TARGET_PAGE_URL)):
+            continue
+
+        # Skip administrative/utility pages
+        path = parsed.path.lower()
+        if any(pat in path for pat in ignore_patterns):
+            continue
+
+        # Valid articles have at least 2 path segments (e.g. /category/story-slug)
+        segments = [s for s in parsed.path.strip("/").split("/") if s]
+        if len(segments) >= 2 and clean not in seen:
+            seen.add(clean)
+            article_links.append(clean)
+
+    return article_links
 
 def fetch_content_from_smry(article_url):
-    """
-    Fetches full article content from SMRY with:
-    - 4-second nominal pacing
-    - HTTP 202 retry handling
-    - Prefix-reader fallback
-    """
-    time.sleep(4)  # Nominal delay to strictly stay under the 5 req/10s burst limit
+    """Queries SMRY reader with pacing, handling 202 status and fallbacks."""
+    time.sleep(3.5)  # Stay strictly within SMRY burst limits
 
     api_headers = {
         "User-Agent": HEADERS["User-Agent"],
         "Accept": "application/json"
     }
 
-    # Attempt 1: SMRY JSON API
+    # Method 1: SMRY JSON API
     try:
-        resp = requests.get(SMRY_API_ENDPOINT, params={"url": article_url}, headers=api_headers, timeout=25)
-        
-        # If SMRY is compiling an uncached page (HTTP 202 Accepted), wait and retry once
+        resp = requests.get(SMRY_API_ENDPOINT, params={"url": article_url}, headers=api_headers, timeout=20)
         if resp.status_code == 202:
-            print("SMRY compiling uncached article, waiting 5 seconds...")
-            time.sleep(5)
-            resp = requests.get(SMRY_API_ENDPOINT, params={"url": article_url}, headers=api_headers, timeout=25)
+            time.sleep(4)
+            resp = requests.get(SMRY_API_ENDPOINT, params={"url": article_url}, headers=api_headers, timeout=20)
 
         if resp.status_code == 200:
             data = resp.json()
             content = data.get("content") or data.get("text") or data.get("markdown") or ""
             if isinstance(content, str) and len(content.strip()) > 100:
                 return format_raw_paragraphs(content)
-        else:
-            print(f"SMRY API returned status {resp.status_code} for {article_url}")
-
     except Exception as e:
-        print(f"SMRY API request error: {e}")
+        print(f"SMRY API attempt failed: {e}")
 
-    # Attempt 2: Direct Prefix Reader Fallback (https://r.smry.ai/<url>)
+    # Method 2: SMRY Reader Web Endpoint Fallback
     try:
         prefix_url = f"https://r.smry.ai/{article_url}"
         alt_resp = requests.get(prefix_url, headers={"User-Agent": HEADERS["User-Agent"]}, timeout=20)
         if alt_resp.status_code == 200 and len(alt_resp.text.strip()) > 150:
             return format_raw_paragraphs(alt_resp.text)
     except Exception as e:
-        print(f"Prefix reader fallback error: {e}")
+        print(f"SMRY prefix attempt failed: {e}")
 
     return None
 
 def format_raw_paragraphs(text):
-    """Formats text blocks into clean HTML paragraph markup."""
+    """Converts raw text lines into clean HTML paragraph markup."""
     blocks = [b.strip() for b in text.split("\n\n") if len(b.strip()) > 20]
     html_out = []
     for block in blocks:
         if block.startswith("#"):
-            clean_head = block.lstrip("#").strip()
-            html_out.append(f"<h4>{clean_head}</h4>")
+            html_out.append(f"<h4>{block.lstrip('#').strip()}</h4>")
         else:
             html_out.append(f"<p>{block}</p>")
     return "".join(html_out)
 
 def parse_article_details(url):
-    """Scrapes headline, summary, featured image, and invokes SMRY with fallback."""
+    """Fetches article metadata and full text with local preview fallback."""
     try:
         res = requests.get(url, headers=HEADERS, timeout=15)
         if res.status_code != 200:
             return None
     except Exception as e:
-        print(f"Failed to fetch {url}: {e}", file=sys.stderr)
+        print(f"Failed to fetch article {url}: {e}", file=sys.stderr)
         return None
 
     soup = BeautifulSoup(res.text, "html.parser")
 
-    # 1. Title
+    # 1. Headline
     title_meta = soup.find("meta", property="og:title")
     title = title_meta["content"].strip() if title_meta and title_meta.get("content") else ""
     if not title and soup.title:
@@ -229,13 +185,12 @@ def parse_article_details(url):
     section_meta = soup.find("meta", property="article:section")
     category_name = section_meta["content"].strip() if section_meta and section_meta.get("content") else "Junior Vikatan"
 
-    # 6. Full Text via SMRY
-    print(f"Fetching SMRY content for: {url}")
+    # 6. SMRY Content
+    print(f"Fetching SMRY text for: {url}")
     body_html = fetch_content_from_smry(url)
 
-    # 7. Local preview fallback if SMRY returns no text
+    # 7. Local preview fallback if SMRY returns empty
     if not body_html:
-        print("SMRY returned empty/blocked. Using available local preview text.")
         paragraphs = []
         for p in soup.find_all("p"):
             parent_class = " ".join(p.parent.get("class", []))
@@ -293,7 +248,7 @@ def create_item_node(dom, article):
     cat_elem.appendChild(dom.createCDATASection(article["category"]))
     item.appendChild(cat_elem)
 
-    # Image Enclosure
+    # Enclosure Image
     if article["image_url"]:
         enclosure = dom.createElement("enclosure")
         enclosure.setAttribute("url", article["image_url"])
@@ -333,11 +288,11 @@ def initialize_empty_feed():
     channel.appendChild(title)
 
     link = dom.createElement("link")
-    link.appendChild(dom.createTextNode(MAIN_MENU_URL))
+    link.appendChild(dom.createTextNode(TARGET_PAGE_URL))
     channel.appendChild(link)
 
     desc = dom.createElement("description")
-    desc.appendChild(dom.createTextNode("Junior Vikatan Cover Story and Featured Categories"))
+    desc.appendChild(dom.createTextNode("Stories directly from Junior Vikatan"))
     channel.appendChild(desc)
 
     return dom, channel
@@ -355,14 +310,15 @@ def main():
     existing_items = list(channel.getElementsByTagName("item"))
     existing_ids = {get_item_identifier(it) for it in existing_items if get_item_identifier(it)}
 
-    candidate_links = fetch_all_candidate_links()
-    print(f"Total discovered candidate links: {len(candidate_links)}")
+    # Scrape only the single page
+    candidate_links = fetch_articles_from_page()
+    print(f"Total stories found on Junior Vikatan page: {len(candidate_links)}")
 
     new_links = [l for l in candidate_links if clean_url(l) not in existing_ids]
-    print(f"New articles to process: {len(new_links)}")
+    print(f"New stories to add: {len(new_links)}")
 
     if not new_links:
-        print("No new articles found. Exiting.")
+        print("No new stories found on the page. Exiting.")
         return
 
     new_item_nodes = []
@@ -372,7 +328,7 @@ def main():
             item_node = create_item_node(dom, article_data)
             new_item_nodes.append(item_node)
 
-    # Insert newest articles at the top
+    # Insert newest items at the top
     first_existing = existing_items[0] if existing_items else None
     for item_node in new_item_nodes:
         if first_existing:
@@ -382,7 +338,7 @@ def main():
             channel.appendChild(dom.createTextNode("\n    "))
             channel.appendChild(item_node)
 
-    # Maintain 100-item maximum
+    # Maintain 100 maximum entries
     all_items = list(channel.getElementsByTagName("item"))
     if len(all_items) > MAX_ITEMS:
         for excess in all_items[MAX_ITEMS:]:
@@ -394,7 +350,7 @@ def main():
     with open(OUTPUT_FILE, "wb") as f:
         f.write(dom.toxml(encoding="utf-8"))
 
-    print(f"Successfully added {len(new_item_nodes)} new articles to {OUTPUT_FILE}.")
+    print(f"Successfully processed {len(new_item_nodes)} new articles. Feed saved to {OUTPUT_FILE}.")
 
 if __name__ == "__main__":
     main()
