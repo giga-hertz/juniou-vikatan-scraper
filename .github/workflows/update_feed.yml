@@ -1,6 +1,8 @@
 name: Update Vikatan Scraped Feed
 
 on:
+  push:
+    branches: [ main ]      # Forces GitHub to run and register it on commit
   schedule:
     - cron: '12,42 * * * *'  # Runs every 30 minutes at non-peak minutes
   workflow_dispatch:        # Manual run trigger
