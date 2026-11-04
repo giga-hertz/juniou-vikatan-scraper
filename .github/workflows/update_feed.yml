@@ -2,7 +2,7 @@ name: Update Vikatan Scraped Feed
 
 on:
   schedule:
-    - cron: '12,42 * * * *'  # Runs every 30 minutes at non-peak minutes
+    - cron: '15 */3 * * *'  # Runs every 30 minutes at non-peak minutes
   workflow_dispatch:        # Manual run trigger
 
 permissions:
