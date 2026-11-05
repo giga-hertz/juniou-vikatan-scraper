@@ -99,7 +99,6 @@ def fetch_articles_from_page():
         if "vikatan.com" not in parsed.netloc:
             continue
 
-        # Skip landing page roots
         if clean in (BASE_URL, f"{BASE_URL}/juniorvikatan", clean_url(TARGET_PAGE_URL)):
             continue
 
@@ -120,10 +119,11 @@ def fetch_articles_from_page():
 
 def clean_and_format_content(text):
     """
-    Formats SMRY markdown:
-    - Removes bracketed promotional links [text](url).
-    - Ensures subheadings are wrapped in explicit <h4><strong> tags.
-    - Preserves consistent 1.25em bottom margins on all paragraphs and indented dash items.
+    Formats SMRY markdown without hardcoded colors to adapt to all RSS themes (Light, Dark, Sepia):
+    - Strips bracketed promotional links [text](url).
+    - Preserves Markdown bold (**text**) globally.
+    - Wraps subheadings in explicit <h4><strong> tags.
+    - Preserves 1.25em paragraph spacing and indented dash blocks.
     """
     if not text:
         return ""
@@ -170,7 +170,7 @@ def clean_and_format_content(text):
             clean_heading = re.sub(r'</?strong>', '', heading_content)
             clean_heading = re.sub(r'[*_#]', '', clean_heading).strip()
             html_out.append(
-                f'<h4 style="margin: 1.5em 0 0.8em 0; font-weight: bold; font-size: 1.15em; line-height: 1.5; color: #111;">'
+                f'<h4 style="margin: 1.6em 0 0.8em 0; font-weight: bold; font-size: 1.15em; line-height: 1.5;">'
                 f'<strong>{clean_heading}</strong>'
                 f'</h4>'
             )
@@ -181,16 +181,16 @@ def clean_and_format_content(text):
             inner = re.sub(r'</?strong>', '', line).strip()
             if len(inner) < 70 and not inner.endswith('.'):
                 html_out.append(
-                    f'<h4 style="margin: 1.5em 0 0.8em 0; font-weight: bold; font-size: 1.15em; line-height: 1.5; color: #111;">'
+                    f'<h4 style="margin: 1.6em 0 0.8em 0; font-weight: bold; font-size: 1.15em; line-height: 1.5;">'
                     f'<strong>{inner}</strong>'
                     f'</h4>'
                 )
                 continue
 
-        # Indented dash/bullet lines (-, *, •, –, —) with consistent bottom spacing
+        # Indented dash/bullet lines (-, *, •, –, —)
         if re.match(r'^[-*•–—]\s+', line):
             html_out.append(
-                f'<p style="margin: 0 0 1.25em 1.5em; text-indent: -1.2em; line-height: 1.85; font-size: 1.05em; color: #222;">'
+                f'<p style="margin: 0 0 1.25em 1.5em; text-indent: -1.2em; line-height: 1.85; font-size: 1.05em;">'
                 f'{line}'
                 f'</p>'
             )
@@ -200,8 +200,8 @@ def clean_and_format_content(text):
         dialogue_pattern = r'^(?!\s*<strong[ >])((?:கேள்வி|பதில்|கழுகார் பதில்|கழுகார்|செய்தியாளர்)\s*[:：])\s*'
         line = re.sub(dialogue_pattern, r'<strong>\1</strong> ', line)
 
-        # Standard paragraph
-        html_out.append(f'<p style="margin: 0 0 1.25em 0; line-height: 1.85; font-size: 1.05em; color: #222;">{line}</p>')
+        # Standard paragraph (no hardcoded colors)
+        html_out.append(f'<p style="margin: 0 0 1.25em 0; line-height: 1.85; font-size: 1.05em;">{line}</p>')
 
     return "".join(html_out)
 
@@ -284,7 +284,7 @@ def parse_article_details(url):
                 break
             text = p.get_text().strip()
             if len(text) > 30:
-                paragraphs.append(f'<p style="margin: 0 0 1.25em 0; line-height: 1.85;">{text}</p>')
+                paragraphs.append(f'<p style="margin: 0 0 1.25em 0; line-height: 1.85; font-size: 1.05em;">{text}</p>')
             if len(paragraphs) >= 3:
                 break
         body_html = "".join(paragraphs)
@@ -301,7 +301,7 @@ def parse_article_details(url):
     }
 
 def create_item_node(dom, article):
-    """Creates an RSS 2.0 item with both <description> and rich <content:encoded>."""
+    """Creates an RSS 2.0 item with theme-adaptive styling."""
     item = dom.createElement("item")
 
     title_elem = dom.createElement("title")
@@ -336,14 +336,15 @@ def create_item_node(dom, article):
         enclosure.setAttribute("length", "0")
         item.appendChild(enclosure)
 
+    # Full HTML body without hardcoded foreground colors
     full_html = ""
     if article["image_url"]:
         full_html += f'<p style="margin-bottom: 1.25em;"><img src="{article["image_url"]}" style="max-width:100%; height:auto; border-radius: 6px;" /></p>'
     if article["summary"]:
-        full_html += f'<p style="margin-bottom: 1.25em; font-size: 1.1em; color: #444;"><strong>{article["summary"]}</strong></p><hr style="border:0; border-top: 1px solid #eee; margin: 1.5em 0;"/>'
+        full_html += f'<p style="margin-bottom: 1.25em; font-size: 1.1em; line-height: 1.6;"><strong>{article["summary"]}</strong></p><hr style="border:0; border-top: 1px solid rgba(128,128,128,0.25); margin: 1.5em 0;"/>'
     if article["body_html"]:
         full_html += article["body_html"]
-    full_html += f'<p style="margin-top: 2em; padding-top: 1em; border-top: 1px solid #eee;"><a href="{article["smry_link"]}" target="_blank" style="color: #0066cc; text-decoration: underline;">📖 Open in SMRY Reader</a></p>'
+    full_html += f'<p style="margin-top: 2em; padding-top: 1em; border-top: 1px solid rgba(128,128,128,0.25);"><a href="{article["smry_link"]}" target="_blank">📖 Open in SMRY Reader</a></p>'
 
     desc_elem = dom.createElement("description")
     desc_summary = article["summary"] if article["summary"] else article["title"]
