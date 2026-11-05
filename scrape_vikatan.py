@@ -15,9 +15,9 @@ SMRY_API_ENDPOINT = "https://r.smry.ai/api/v1/read"
 OUTPUT_FILE = "feed.xml"
 MAX_ITEMS = 100
 
-# Pattern to detect edition date slugs (e.g., 08-nov-2026, 2026-nov-08, 08-11-2026)
-DATE_ISSUE_PATTERN = re.compile(
-    r'\b(?:\d{1,2}-[a-zA-Z]{3,9}-\d{4}|\d{4}-[a-zA-Z]{3,9}-\d{1,2}|\d{1,2}-\d{1,2}-\d{4})\b',
+# Pattern matching edition date slugs (e.g., 08-nov-2026, 2026-nov-08, 08-11-2026)
+DATE_PATTERN = re.compile(
+    r'^(?:\d{1,2}-[a-zA-Z]{3,9}-\d{4}|\d{4}-[a-zA-Z]{3,9}-\d{1,2}|\d{1,2}-\d{1,2}-\d{4})$',
     re.IGNORECASE
 )
 
@@ -52,8 +52,19 @@ def get_item_identifier(item):
                 return clean_url(val)
     return None
 
+def is_issue_index_link(clean_url_str):
+    """
+    Identifies issue cover indices like /juniorvikatan/08-nov-2026 (only 2 segments).
+    Returns False for actual articles (e.g. /juniorvikatan/08-nov-2026/mister-kazhugar).
+    """
+    parsed = urllib.parse.urlparse(clean_url_str)
+    segments = [s for s in parsed.path.strip("/").split("/") if s]
+    if len(segments) == 2 and segments[0].lower() == "juniorvikatan" and DATE_PATTERN.match(segments[1]):
+        return True
+    return False
+
 def fetch_articles_from_page():
-    """Scrapes only the target landing page, skipping dated issue URLs."""
+    """Scrapes all valid article links directly from the target page."""
     try:
         response = requests.get(TARGET_PAGE_URL, headers=HEADERS, timeout=15)
         response.raise_for_status()
@@ -63,7 +74,8 @@ def fetch_articles_from_page():
 
     soup = BeautifulSoup(response.text, "html.parser")
 
-    for tag in soup(["header", "nav", "footer"]):
+    # Decompose only global site navigation and footers
+    for tag in soup.find_all(["nav", "footer"]):
         tag.decompose()
 
     ignore_patterns = [
@@ -87,6 +99,7 @@ def fetch_articles_from_page():
         if "vikatan.com" not in parsed.netloc:
             continue
 
+        # Skip landing page roots
         if clean in (BASE_URL, f"{BASE_URL}/juniorvikatan", clean_url(TARGET_PAGE_URL)):
             continue
 
@@ -94,8 +107,8 @@ def fetch_articles_from_page():
         if any(pat in path for pat in ignore_patterns):
             continue
 
-        # Skip issue date links (e.g., /juniorvikatan/08-nov-2026)
-        if DATE_ISSUE_PATTERN.search(parsed.path):
+        # Only ignore the pure issue edition cover index (e.g. /juniorvikatan/08-nov-2026)
+        if is_issue_index_link(clean):
             continue
 
         segments = [s for s in parsed.path.strip("/").split("/") if s]
@@ -107,12 +120,10 @@ def fetch_articles_from_page():
 
 def clean_and_format_content(text):
     """
-    Cleans SMRY markdown:
-    - Removes any link starting with [ and ending with ] followed by a URL.
-    - Strips [## ] anchors, empty brackets, and standalone URLs.
-    - Preserves Markdown bold (**text**) globally before splitting lines.
-    - Automatically bolds Tamil dialogue prompts (கேள்வி:, பதில்:, etc.).
-    - Wraps each paragraph in spaced <p> tags with proper line-height.
+    Formats SMRY markdown:
+    - Removes bracketed promotional links [text](url).
+    - Ensures subheadings are wrapped in explicit <h4><strong> tags.
+    - Preserves consistent 1.25em bottom margins on all paragraphs and indented dash items.
     """
     if not text:
         return ""
@@ -120,7 +131,7 @@ def clean_and_format_content(text):
     # 1. Remove nested image links like [![img](url)](url)
     text = re.sub(r'\[\s*!\[[^\]]*\]\([^\)]+\)\s*\](?:\([^\)]+\)|https?://\S+)?', '', text)
 
-    # 2. Remove all [text] followed by a URL (e.g., [text](url), [text] url, [text]: url, ## [text](url))
+    # 2. Remove all [text] followed by a URL (e.g. [text](url), [text] url, [text]: url)
     link_pattern = re.compile(
         r'#{0,6}\s*!?\[[^\]]*\]\s*:?\s*(?:\([^\)]+\)|<[^>]+>|https?://\S+)', 
         re.IGNORECASE
@@ -130,11 +141,11 @@ def clean_and_format_content(text):
         prev = text
         text = link_pattern.sub('', text)
 
-    # 3. Clean leftover empty brackets and bare URLs on their own lines
+    # 3. Clean leftover brackets and bare URLs on their own lines
     text = re.sub(r'\[\s*\](?:\([^\)]*\)|<[^>]+>)?', '', text)
     text = re.sub(r'^\s*https?://\S+\s*$', '', text, flags=re.MULTILINE)
 
-    # 4. Drop lines that contain only markdown hash symbols
+    # 4. Clean standalone hash lines
     cleaned_lines = []
     for line in text.split('\n'):
         if re.match(r'^#{1,6}\s*$', line.strip()):
@@ -147,31 +158,49 @@ def clean_and_format_content(text):
     text = re.sub(r'__\s*([\s\S]+?)\s*__', r'<strong>\1</strong>', text)
     text = re.sub(r'(?<!\*)\*(?!\*)\s*([^\*\n]+?)\s*(?<!\*)\*(?!\*)', r'<em>\1</em>', text)
 
-    # 6. Process line-by-line / paragraph-by-paragraph
+    # 6. Process line-by-line
     raw_lines = [line.strip() for line in text.split('\n') if line.strip()]
 
     html_out = []
     for line in raw_lines:
-        # Check for Markdown heading (#, ##, ###, etc.)
+        # Check for Markdown headings (#, ##, ###)
         h_match = re.match(r'^(#{1,6})\s+(.+)$', line)
         if h_match:
-            level = len(h_match.group(1))
             heading_content = h_match.group(2).strip()
-            tag = f"h{min(level + 2, 6)}"
-            html_out.append(f'<{tag} style="margin: 1.4em 0 0.6em 0; font-weight: 700; color: #111;">{heading_content}</{tag}>')
+            clean_heading = re.sub(r'</?strong>', '', heading_content)
+            clean_heading = re.sub(r'[*_#]', '', clean_heading).strip()
+            html_out.append(
+                f'<h4 style="margin: 1.5em 0 0.8em 0; font-weight: bold; font-size: 1.15em; line-height: 1.5; color: #111;">'
+                f'<strong>{clean_heading}</strong>'
+                f'</h4>'
+            )
             continue
 
-        # Check for list items
-        if re.match(r'^[-*•]\s+', line):
-            item_text = re.sub(r'^[-*•]\s+', '', line)
-            html_out.append(f'<li style="margin-bottom: 0.6em; line-height: 1.85;">{item_text}</li>')
+        # Check for standalone bold subheading lines
+        if re.match(r'^<strong>[^<]+</strong>$', line):
+            inner = re.sub(r'</?strong>', '', line).strip()
+            if len(inner) < 70 and not inner.endswith('.'):
+                html_out.append(
+                    f'<h4 style="margin: 1.5em 0 0.8em 0; font-weight: bold; font-size: 1.15em; line-height: 1.5; color: #111;">'
+                    f'<strong>{inner}</strong>'
+                    f'</h4>'
+                )
+                continue
+
+        # Indented dash/bullet lines (-, *, •, –, —) with consistent bottom spacing
+        if re.match(r'^[-*•–—]\s+', line):
+            html_out.append(
+                f'<p style="margin: 0 0 1.25em 1.5em; text-indent: -1.2em; line-height: 1.85; font-size: 1.05em; color: #222;">'
+                f'{line}'
+                f'</p>'
+            )
             continue
 
-        # Format Tamil dialogue/interview prefixes if not already bolded
+        # Bold common Tamil interview/dialogue prefixes
         dialogue_pattern = r'^(?!\s*<strong[ >])((?:கேள்வி|பதில்|கழுகார் பதில்|கழுகார்|செய்தியாளர்)\s*[:：])\s*'
         line = re.sub(dialogue_pattern, r'<strong>\1</strong> ', line)
 
-        # Wrap each paragraph with comfortable line spacing and bottom margins
+        # Standard paragraph
         html_out.append(f'<p style="margin: 0 0 1.25em 0; line-height: 1.85; font-size: 1.05em; color: #222;">{line}</p>')
 
     return "".join(html_out)
@@ -366,7 +395,7 @@ def main():
     existing_ids = {get_item_identifier(it) for it in existing_items if get_item_identifier(it)}
 
     candidate_links = fetch_articles_from_page()
-    print(f"Total non-dated articles found on target page: {len(candidate_links)}")
+    print(f"Total stories found on target page: {len(candidate_links)}")
 
     new_links = [l for l in candidate_links if clean_url(l) not in existing_ids]
     print(f"New articles to add: {len(new_links)}")
