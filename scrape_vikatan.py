@@ -12,7 +12,7 @@ from bs4 import BeautifulSoup
 BASE_URL = "https://www.vikatan.com"
 TARGET_PAGE_URL = "https://www.vikatan.com/juniorvikatan?pfrom=header-submenu"
 SMRY_API_ENDPOINT = "https://r.smry.ai/api/v1/read"
-OUTPUT_FILE = "feed.xml"
+OUTPUT_FILE = "myfeed.xml"
 MAX_ITEMS = 100
 
 # Pattern matching edition date slugs (e.g., 08-nov-2026, 2026-nov-08, 08-11-2026)
